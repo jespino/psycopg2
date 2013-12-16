@@ -990,6 +990,156 @@ pq_execute(cursorObject *curs, const char *query, int async, int no_result)
     return 1-async;
 }
 
+/* pq_prepare - execute a query, possibly asynchronously
+ *
+ * With no_result an eventual query result is discarded.
+ * Currently only used to implement cursor.executemany().
+ *
+ * This function locks the connection object
+ * This function call Py_*_ALLOW_THREADS macros
+*/
+
+RAISES_NEG int
+pq_prepare(cursorObject *curs, const char *name, const char *query)
+{
+    PGresult *pgres = NULL;
+    char *error = NULL;
+    int async_status = ASYNC_WRITE;
+    int *formats = {0};
+
+    /* if the status of the connection is critical raise an exception and
+       definitely close the connection */
+    if (curs->conn->critical) {
+        return pq_resolve_critical(curs->conn, 1);
+    }
+
+    /* check status of connection, raise error if not OK */
+    if (PQstatus(curs->conn->pgconn) != CONNECTION_OK) {
+        Dprintf("pq_prepare: connection NOT OK");
+        PyErr_SetString(OperationalError, PQerrorMessage(curs->conn->pgconn));
+        return -1;
+    }
+    Dprintf("curs_prepare: pg connection at %p OK", curs->conn->pgconn);
+
+    Py_BEGIN_ALLOW_THREADS;
+    pthread_mutex_lock(&(curs->conn->lock));
+
+    if (pq_begin_locked(curs->conn, &pgres, &error, &_save) < 0) {
+        pthread_mutex_unlock(&(curs->conn->lock));
+        Py_BLOCK_THREADS;
+        pq_complete_error(curs->conn, &pgres, &error);
+        return -1;
+    }
+
+    CLEARPGRES(curs->pgres);
+    Dprintf("pq_prepare: preparing SYNC query: pgconn = %p", curs->conn->pgconn);
+    Dprintf("    %-.200s", name);
+
+    curs->pgres = PQprepare(curs->conn->pgconn, name, query, 1, formats);
+
+    /* dont let pgres = NULL go to pq_fetch() */
+    if (curs->pgres == NULL) {
+        pthread_mutex_unlock(&(curs->conn->lock));
+        Py_BLOCK_THREADS;
+        if (!PyErr_Occurred()) {
+            PyErr_SetString(OperationalError,
+                            PQerrorMessage(curs->conn->pgconn));
+        }
+        return -1;
+    }
+
+    /* Process notifies here instead of when fetching the tuple as we are
+     * into the same critical section that received the data. Without this
+     * care, reading notifies may disrupt other thread communications.
+     * (as in ticket #55). */
+    Py_BLOCK_THREADS;
+    conn_notifies_process(curs->conn);
+    conn_notice_process(curs->conn);
+    Py_UNBLOCK_THREADS;
+
+    pthread_mutex_unlock(&(curs->conn->lock));
+    Py_END_ALLOW_THREADS;
+
+    return 0;
+}
+
+/* pq_prepared_exec - execute a prepared query
+ *
+ * With no_result an eventual query result is discarded.
+ * Currently only used to implement cursor.executemany().
+ *
+ * This function locks the connection object
+ * This function call Py_*_ALLOW_THREADS macros
+*/
+
+RAISES_NEG int
+pq_prepared_exec(cursorObject *curs, const char *name, int nValues,
+        const char * const *values, int *paramsLengths, int *paramsFormats, int no_result)
+{
+    PGresult *pgres = NULL;
+    char *error = NULL;
+
+    /* if the status of the connection is critical raise an exception and
+       definitely close the connection */
+    if (curs->conn->critical) {
+        return pq_resolve_critical(curs->conn, 1);
+    }
+
+    /* check status of connection, raise error if not OK */
+    if (PQstatus(curs->conn->pgconn) != CONNECTION_OK) {
+        Dprintf("pq_prepared_exec: connection NOT OK");
+        PyErr_SetString(OperationalError, PQerrorMessage(curs->conn->pgconn));
+        return -1;
+    }
+    Dprintf("curs_execute: pg connection at %p OK", curs->conn->pgconn);
+
+    Py_BEGIN_ALLOW_THREADS;
+    pthread_mutex_lock(&(curs->conn->lock));
+
+    if (pq_begin_locked(curs->conn, &pgres, &error, &_save) < 0) {
+        pthread_mutex_unlock(&(curs->conn->lock));
+        Py_BLOCK_THREADS;
+        pq_complete_error(curs->conn, &pgres, &error);
+        return -1;
+    }
+
+    CLEARPGRES(curs->pgres);
+    Dprintf("pq_prepared_exec: executing prepared query: pgconn = %p", curs->conn->pgconn);
+    Dprintf("    %-.200s", name);
+
+    curs->pgres = PQexecPrepared(curs->conn->pgconn, name, nValues, values, paramsLengths, paramsFormats, 0);
+
+    /* dont let pgres = NULL go to pq_fetch() */
+    if (curs->pgres == NULL) {
+        pthread_mutex_unlock(&(curs->conn->lock));
+        Py_BLOCK_THREADS;
+        if (!PyErr_Occurred()) {
+            PyErr_SetString(OperationalError,
+                            PQerrorMessage(curs->conn->pgconn));
+        }
+        return -1;
+    }
+
+    /* Process notifies here instead of when fetching the tuple as we are
+     * into the same critical section that received the data. Without this
+     * care, reading notifies may disrupt other thread communications.
+     * (as in ticket #55). */
+    Py_BLOCK_THREADS;
+    conn_notifies_process(curs->conn);
+    conn_notice_process(curs->conn);
+    Py_UNBLOCK_THREADS;
+
+    pthread_mutex_unlock(&(curs->conn->lock));
+    Py_END_ALLOW_THREADS;
+
+    /* if the execute was sync, we call pq_fetch() immediately,
+       to respect the old DBAPI-2.0 compatible behaviour */
+    Dprintf("pq_prepared_exec: entering synchronous DBAPI compatibility mode");
+    if (pq_fetch(curs, no_result) < 0) return -1;
+
+    return 1;
+}
+
 /* send an async query to the backend.
  *
  * Return 1 if command succeeded, else 0.
@@ -1474,6 +1624,7 @@ pq_fetch(cursorObject *curs, int no_result)
 
     pgstatus = PQresultStatus(curs->pgres);
     Dprintf("pq_fetch: pgstatus = %s", PQresStatus(pgstatus));
+    Dprintf("pq_fetch: pgerror = %s", PQresultErrorMessage(curs->pgres));
 
     /* backend status message */
     Py_XDECREF(curs->pgstatus);

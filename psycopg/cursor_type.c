@@ -498,6 +498,160 @@ psyco_curs_execute(cursorObject *self, PyObject *args, PyObject *kwargs)
     Py_RETURN_NONE;
 }
 
+
+#define psyco_curs_prepare_doc \
+"prepare(name, query) -- Prepare a query."
+
+RAISES_NEG static int
+_psyco_curs_prepare(cursorObject *self, PyObject *name, PyObject *operation)
+{
+    int res = -1;
+    int tmp;
+
+    operation = _psyco_curs_validate_sql_basic(self, operation);
+
+    /* Any failure from here forward should 'goto fail' rather than 'return 0'
+       directly. */
+
+    if (name == NULL) { goto exit; }
+    if (operation == NULL) { goto exit; }
+
+    CLEARPGRES(self->pgres);
+    Py_CLEAR(self->query);
+    Dprintf("psyco_curs_prepare: starting prepare of new query");
+
+    self->query = operation;
+    operation = NULL;
+
+    /* At this point, the SQL statement must be str, not unicode */
+
+    tmp = pq_prepare(self, Bytes_AS_STRING(name), Bytes_AS_STRING(self->query));
+    Dprintf("psyco_curs_prepare: res = %d, pgres = %p", tmp, self->pgres);
+    Dprintf("psyco_curs_prepare: pgerror = %s", PQresultErrorMessage(self->pgres));
+
+    if (tmp < 0) { goto exit; }
+
+    res = 0; /* Success */
+
+exit:
+    /* Py_XDECREF(operation) is safe because the original reference passed
+       by the caller was overwritten with either NULL or a new
+       reference */
+    Py_XDECREF(operation);
+
+    return res;
+}
+
+static PyObject *
+psyco_curs_prepare(cursorObject *self, PyObject *args, PyObject *kwargs)
+{
+    PyObject *operation = NULL, *name = NULL;
+
+    static char *kwlist[] = {"name", "query", NULL};
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO", kwlist,
+                                     &name, &operation)) {
+        return NULL;
+    }
+
+    EXC_IF_CURS_CLOSED(self);
+    EXC_IF_ASYNC_IN_PROGRESS(self, prepare);
+    EXC_IF_TPC_PREPARED(self->conn, prepare);
+
+    if (0 > _psyco_curs_prepare(self, name, operation)) {
+        return NULL;
+    }
+
+    /* success */
+    Py_RETURN_NONE;
+}
+
+#define psyco_curs_prepared_exec_doc \
+"prepared_exec(name, vars=None) -- Execute a prepared query."
+
+RAISES_NEG static int
+_psyco_curs_prepared_exec(cursorObject *self, PyObject *name, PyObject *vars)
+{
+    int res = -1;
+    int tmp;
+    int x;
+    char **values;
+    int *valuesLengths;
+    int *valuesFormats;
+
+    values = (char**)PyMem_Malloc(PyList_Size(vars));
+    if (values == NULL) {
+        PyErr_NoMemory();
+        goto exit1;
+    }
+
+    valuesLengths = (int*)PyMem_Malloc(PyList_Size(vars));
+    if (valuesLengths == NULL) {
+        PyErr_NoMemory();
+        goto exit2;
+    }
+
+    valuesFormats = (int*)PyMem_Malloc(PyList_Size(vars));
+    if (valuesFormats == NULL) {
+        PyErr_NoMemory();
+        goto exit3;
+    }
+
+    for(x=0; x<PyList_Size(vars); x++) {
+        values[x] = Bytes_AS_STRING(PyList_GetItem(vars, x));
+        valuesLengths[x] = PyBytes_Size(PyList_GetItem(vars, x));
+        valuesFormats[x] = 0;
+    }
+
+    if (name == NULL) { goto exit1; }
+
+    CLEARPGRES(self->pgres);
+    Dprintf("psyco_curs_prepare: starting prepared query execution");
+
+    /* At this point, the SQL statement must be str, not unicode */
+
+    tmp = pq_prepared_exec(self, Bytes_AS_STRING(name), PyList_Size(vars), values, valuesLengths, valuesFormats, 0);
+    Dprintf("psyco_curs_prepare: res = %d, pgres = %p", tmp, self->pgres);
+    if (tmp < 0) { goto exit1; }
+
+    res = 0; /* Success */
+
+exit1:
+    PyMem_Free(valuesFormats);
+
+exit2:
+    PyMem_Free(valuesLengths);
+
+exit3:
+    PyMem_Free(values);
+
+    return res;
+}
+
+static PyObject *
+psyco_curs_prepared_exec(cursorObject *self, PyObject *args, PyObject *kwargs)
+{
+    PyObject *operation = NULL, *name = NULL, *vars = NULL;
+
+    static char *kwlist[] = {"name", "vars", NULL};
+
+    if (!PyArg_ParseTupleAndKeywords(args, kwargs, "OO", kwlist,
+                                     &name, &vars)) {
+        return NULL;
+    }
+
+    EXC_IF_CURS_CLOSED(self);
+    EXC_IF_ASYNC_IN_PROGRESS(self, prepare);
+    EXC_IF_TPC_PREPARED(self->conn, prepare);
+
+    if (0 > _psyco_curs_prepared_exec(self, name, vars)) {
+        return NULL;
+    }
+
+    /* success */
+    Py_RETURN_NONE;
+}
+
 #define psyco_curs_executemany_doc \
 "executemany(query, vars_list) -- Execute many queries with bound vars."
 
@@ -1740,6 +1894,10 @@ static struct PyMethodDef cursorObject_methods[] = {
      METH_VARARGS, psyco_curs_exit_doc},
     /* psycopg extensions */
 #ifdef PSYCOPG_EXTENSIONS
+    {"prepare", (PyCFunction)psyco_curs_prepare,
+     METH_VARARGS, psyco_curs_prepare_doc},
+    {"prepared_exec", (PyCFunction)psyco_curs_prepared_exec,
+     METH_VARARGS, psyco_curs_prepare_doc},
     {"cast", (PyCFunction)psyco_curs_cast,
      METH_VARARGS, psyco_curs_cast_doc},
     {"mogrify", (PyCFunction)psyco_curs_mogrify,
